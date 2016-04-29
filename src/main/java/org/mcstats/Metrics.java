@@ -27,34 +27,27 @@
  */
 package org.mcstats;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.UnsupportedEncodingException;
+import net.glowstone.GlowServer;
+import org.bukkit.Bukkit;
+import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.io.*;
 import java.net.Proxy;
 import java.net.URL;
 import java.net.URLConnection;
 import java.net.URLEncoder;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashSet;
-import java.util.Properties;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
+import java.util.logging.Level;
 import java.util.zip.GZIPOutputStream;
 
-public abstract class Metrics {
+public class Metrics {
 
     /**
      * The current revision number
      */
-    private final static int REVISION = 7;
+    private static final int REVISION = 7;
 
     /**
      * The base url of the metrics domain
@@ -69,32 +62,22 @@ public abstract class Metrics {
     /**
      * Interval of time to ping (in minutes)
      */
-    private static final int PING_INTERVAL = 15;
+    private static final int PING_INTERVAL = 10;
 
     /**
-     * Debug mode
+     * The server this metrics submits for
      */
-    private final boolean debug;
+    private final GlowServer server;
 
     /**
      * All of the custom graphs to submit to metrics
      */
-    private final Set<Graph> graphs = Collections.synchronizedSet(new HashSet<Graph>());
+    private final Set<Graph> graphs = Collections.synchronizedSet(new HashSet<>());
 
     /**
      * The plugin configuration file
      */
-    private final Properties properties = new Properties();
-
-    /**
-     * The plugin's name
-     */
-    private final String pluginName;
-
-    /**
-     * The plugin's version
-     */
-    private final String pluginVersion;
+    private final YamlConfiguration configuration;
 
     /**
      * The plugin configuration file
@@ -107,66 +90,46 @@ public abstract class Metrics {
     private final String guid;
 
     /**
+     * Debug mode
+     */
+    private final boolean debug;
+
+    /**
      * Lock for synchronization
      */
     private final Object optOutLock = new Object();
 
     /**
-     * The thread submission is running on
+     * The scheduled task
      */
-    private Thread thread = null;
+    private volatile BukkitTask task = null;
 
-    public Metrics(String pluginName, String pluginVersion) throws IOException {
-        if (pluginName == null || pluginVersion == null) {
-            throw new IllegalArgumentException("Plugin cannot be null");
+    public Metrics(final GlowServer server) throws IOException {
+        if (server == null) {
+            throw new IllegalArgumentException("Server cannot be null");
         }
 
-        this.pluginName = pluginName;
-        this.pluginVersion = pluginVersion;
+        this.server = server;
 
+        // load the config
         configurationFile = getConfigFile();
+        configuration = YamlConfiguration.loadConfiguration(configurationFile);
 
-        if (!configurationFile.exists()) {
-            if (configurationFile.getPath().contains("/") || configurationFile.getPath().contains("\\")) {
-                File parent = new File(configurationFile.getParent());
-                if (!parent.exists()) {
-                    parent.mkdir();
-                }
-            }
+        // add some defaults
+        configuration.addDefault("opt-out", false);
+        configuration.addDefault("guid", UUID.randomUUID().toString());
+        configuration.addDefault("debug", false);
 
-            configurationFile.createNewFile(); // config file
-            properties.put("opt-out", "false");
-            properties.put("guid", UUID.randomUUID().toString());
-            properties.put("debug", "false");
-            properties.store(new FileOutputStream(configurationFile), "http://mcstats.org");
-        } else {
-            properties.load(new FileInputStream(configurationFile));
+        // Do we need to create the file?
+        if (configuration.get("guid", null) == null) {
+            configuration.options().header("http://mcstats.org").copyDefaults(true);
+            configuration.save(configurationFile);
         }
 
-        guid = properties.getProperty("guid");
-        debug = Boolean.parseBoolean(properties.getProperty("debug"));
+        // Load the guid then
+        guid = configuration.getString("guid");
+        debug = configuration.getBoolean("debug", false);
     }
-
-    /**
-     * Get the full server version
-     *
-     * @return
-     */
-    public abstract String getFullServerVersion();
-
-    /**
-     * Get the amount of players online
-     *
-     * @return
-     */
-    public abstract int getPlayersOnline();
-
-    /**
-     * Gets the File object of the config file that should be used to store data such as the GUID and opt-out status
-     *
-     * @return the File object for the config file
-     */
-    public abstract File getConfigFile();
 
     /**
      * Construct and create a Graph that can be used to separate specific plotters to their own graphs on the metrics
@@ -191,7 +154,7 @@ public abstract class Metrics {
     }
 
     /**
-     * Add a Graph object to SpoutMetrics that represents data for the plugin that should be sent to the backend
+     * Add a Graph object to BukkitMetrics that represents data for the plugin that should be sent to the backend
      *
      * @param graph The name of the graph
      */
@@ -218,59 +181,45 @@ public abstract class Metrics {
             }
 
             // Is metrics already running?
-            if (thread != null) {
+            if (task != null) {
                 return true;
             }
 
-            thread = new Thread(new Runnable() {
+            // Begin hitting the server with glorious data
+            task = server.getScheduler().runTaskTimerAsynchronously(null, new Runnable() { // TODO
 
                 private boolean firstPost = true;
 
-                private long nextPost = 0L;
-
                 public void run() {
-                    while (thread != null) {
-                        if (nextPost == 0L || System.currentTimeMillis() > nextPost) {
-                            try {
-                                // This has to be synchronized or it can collide with the disable method.
-                                synchronized (optOutLock) {
-                                    // Disable Task, if it is running and the server owner decided to opt-out
-                                    if (isOptOut() && thread != null) {
-                                        Thread temp = thread;
-                                        thread = null;
-                                        // Tell all plotters to stop gathering information.
-                                        for (Graph graph : graphs) {
-                                            graph.onOptOut();
-                                        }
-                                        temp.interrupt(); // interrupting ourselves
-                                        return;
-                                    }
-                                }
-
-                                // We use the inverse of firstPost because if it is the first time we are posting,
-                                // it is not a interval ping, so it evaluates to FALSE
-                                // Each time thereafter it will evaluate to TRUE, i.e PING!
-                                postPlugin(!firstPost);
-
-                                // After the first post we set firstPost to false
-                                // Each post thereafter will be a ping
-                                firstPost = false;
-                                nextPost = System.currentTimeMillis() + (PING_INTERVAL * 60 * 1000);
-                            } catch (IOException e) {
-                                if (debug) {
-                                    System.out.println("[Metrics] " + e.getMessage());
+                    try {
+                        // This has to be synchronized or it can collide with the disable method.
+                        synchronized (optOutLock) {
+                            // Disable Task, if it is running and the server owner decided to opt-out
+                            if (isOptOut() && task != null) {
+                                task.cancel();
+                                task = null;
+                                // Tell all plotters to stop gathering information.
+                                for (Graph graph : graphs) {
+                                    graph.onOptOut();
                                 }
                             }
                         }
 
-                        try {
-                            Thread.sleep(100L);
-                        } catch (InterruptedException e) {
+                        // We use the inverse of firstPost because if it is the first time we are posting,
+                        // it is not a interval ping, so it evaluates to FALSE
+                        // Each time thereafter it will evaluate to TRUE, i.e PING!
+                        postPlugin(!firstPost);
+
+                        // After the first post we set firstPost to false
+                        // Each post thereafter will be a ping
+                        firstPost = false;
+                    } catch (IOException e) {
+                        if (debug) {
+                            Bukkit.getLogger().log(Level.INFO, "[Metrics] " + e.getMessage());
                         }
                     }
                 }
-            }, "MCStats / Plugin Metrics");
-            thread.start();
+            }, 1, PING_INTERVAL * 1200);
 
             return true;
         }
@@ -285,15 +234,19 @@ public abstract class Metrics {
         synchronized (optOutLock) {
             try {
                 // Reload the metrics file
-                properties.load(new FileInputStream(configurationFile));
+                configuration.load(getConfigFile());
             } catch (IOException ex) {
                 if (debug) {
-                    System.out.println("[Metrics] " + ex.getMessage());
+                    Bukkit.getLogger().log(Level.INFO, "[Metrics] " + ex.getMessage());
+                }
+                return true;
+            } catch (InvalidConfigurationException ex) {
+                if (debug) {
+                    Bukkit.getLogger().log(Level.INFO, "[Metrics] " + ex.getMessage());
                 }
                 return true;
             }
-
-            return Boolean.parseBoolean(properties.getProperty("opt-out"));
+            return configuration.getBoolean("opt-out", false);
         }
     }
 
@@ -307,12 +260,12 @@ public abstract class Metrics {
         synchronized (optOutLock) {
             // Check if the server owner has already set opt-out, if not, set it.
             if (isOptOut()) {
-                properties.setProperty("opt-out", "false");
-                properties.store(new FileOutputStream(configurationFile), "http://mcstats.org");
+                configuration.set("opt-out", false);
+                configuration.save(configurationFile);
             }
 
             // Enable Task, if it is not running
-            if (thread == null) {
+            if (task == null) {
                 start();
             }
         }
@@ -328,24 +281,56 @@ public abstract class Metrics {
         synchronized (optOutLock) {
             // Check if the server owner has already set opt-out, if not, set it.
             if (!isOptOut()) {
-                properties.setProperty("opt-out", "true");
-                properties.store(new FileOutputStream(configurationFile), "http://mcstats.org");
+                configuration.set("opt-out", true);
+                configuration.save(configurationFile);
             }
 
             // Disable Task, if it is running
-            if (thread != null) {
-                thread.interrupt();
-                thread = null;
+            if (task != null) {
+                task.cancel();
+                task = null;
             }
         }
+    }
+
+    /**
+     * Gets the File object of the config file that should be used to store data such as the GUID and opt-out status
+     *
+     * @return the File object for the config file
+     */
+    public File getConfigFile() {
+
+        // return => base/plugins/PluginMetrics/config.yml
+        return new File(new File("plugins/PluginMetrics"), "config.yml");
+    }
+
+    /**
+     * Gets the online player
+     *
+     * @return online player amount
+     */
+    private int getOnlinePlayers() {
+        try {
+            return server.getOnlinePlayers().size();
+        } catch (Exception ex) {
+            if (debug) {
+                Bukkit.getLogger().log(Level.INFO, "[Metrics] " + ex.getMessage());
+            }
+        }
+
+        return 0;
     }
 
     /**
      * Generic method that posts a plugin to the metrics website
      */
     private void postPlugin(final boolean isPing) throws IOException {
-        String serverVersion = getFullServerVersion();
-        int playersOnline = getPlayersOnline();
+        // Server software specific section
+        String pluginName = "GlowstonePlusPlus";
+        boolean onlineMode = Bukkit.getServer().getOnlineMode(); // TRUE if online mode is enabled
+        String pluginVersion = (Metrics.class.getPackage().getImplementationVersion() != null) ? Metrics.class.getPackage().getImplementationVersion() : "unknown";
+        String serverVersion = Bukkit.getBukkitVersion();
+        int playersOnline = getOnlinePlayers();
 
         // END server software specific section -- all code below does not use any code outside of this class / Java
 
@@ -363,7 +348,7 @@ public abstract class Metrics {
         String osname = System.getProperty("os.name");
         String osarch = System.getProperty("os.arch");
         String osversion = System.getProperty("os.version");
-        String java_version = System.getProperty("java.version");
+        String javaVersion = System.getProperty("java.version");
         int coreCount = Runtime.getRuntime().availableProcessors();
 
         // normalize os arch .. amd64 -> x86_64
@@ -375,8 +360,8 @@ public abstract class Metrics {
         appendJSONPair(json, "osarch", osarch);
         appendJSONPair(json, "osversion", osversion);
         appendJSONPair(json, "cores", Integer.toString(coreCount));
-        // appendJSONPair(json, "auth_mode", onlineMode ? "1" : "0");
-        appendJSONPair(json, "java_version", java_version);
+        appendJSONPair(json, "auth_mode", onlineMode ? "1" : "0");
+        appendJSONPair(json, "java_version", javaVersion);
 
         // If we're pinging, append it
         if (isPing) {
@@ -516,6 +501,7 @@ public abstract class Metrics {
             if (gzos != null) try {
                 gzos.close();
             } catch (IOException ignore) {
+                ;
             }
         }
 
@@ -707,7 +693,7 @@ public abstract class Metrics {
     /**
      * Interface used to collect custom data for a plugin
      */
-    public static abstract class Plotter {
+    public abstract static class Plotter {
 
         /**
          * The plot's name

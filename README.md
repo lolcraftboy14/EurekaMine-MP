@@ -1,3 +1,4 @@
+EurekaMine-MP is a continuation of the [Dragonet Server Software](https://GitHub.com/DragonetMC/Dragonet).
 ## **EurekaMine-MP** ##
 
 The **best** Minecraft server software out there!

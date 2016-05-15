@@ -17,8 +17,8 @@ public final class DragonetVersioning {
     public final static String DRAGONET_VERSION = "BlueSky(0.0.4) preR1";
 
     public final static String MINECRAFT_PC_VERSION = "1.9.2";
-    public final static String MINECRAFT_PE_VERSION = "0.14.1";
+    public final static String MINECRAFT_PE_VERSION = "0.14.2";
 
     
-    public final static int MINECRAFT_PE_PROTOCOL = 38;
+    public final static int MINECRAFT_PE_PROTOCOL = 60;
 }
